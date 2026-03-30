@@ -1,102 +1,147 @@
-"""FemScale Metrics Collection - Lightweight session-based metrics."""
+"""FemScale Metrics Collection - Redis-backed session metrics (cross-process)."""
 
-import threading
+import json
+from datetime import datetime, timezone
 from typing import Dict, List, Any
-from collections import deque
-from datetime import datetime
 
 from redis_client import get_redis_client
 
 
+# Redis keys for metrics
+_KEY_JOBS_COMPLETED = "femscale:metrics:jobs_completed"
+_KEY_TOTAL_COST = "femscale:metrics:total_cost"
+_KEY_WORKERS_ACTIVE = "femscale:metrics:workers_active"
+_KEY_WORKERS_TARGET = "femscale:metrics:workers_target"
+_KEY_EVENTS = "femscale:metrics:events"
+_MAX_EVENTS = 100
+
+
 class MetricsCollection:
-    """Thread-safe metrics collection for FemScale."""
+    """Redis-backed metrics collection for FemScale.
 
-    def __init__(self, max_events: int = 100):
-        """Initialize metrics collection.
-        
-        Args:
-            max_events: Maximum number of events to keep in history
-        """
-        self.lock = threading.Lock()
-        self.events: deque = deque(maxlen=max_events)
-        self.jobs_completed_count = 0
-        self.total_cost_usd = 0.0
-        self.workers_active_count = 0
-        self.workers_target_count = 0
+    Stores all counters in Redis so worker, scaler, and API
+    processes share the same live data.
+    """
 
-    def add_event(self, event_type: str, details: Dict[str, Any]) -> None:
-        """
-        Record a metrics event.
-        
-        Args:
-            event_type: Type of event (e.g., 'worker_spawned', 'job_completed')
-            details: Event details dict
-        """
-        with self.lock:
-            event = {
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-                "type": event_type,
-                **details,
-            }
-            self.events.append(event)
+    def __init__(self):
+        """Initialize — nothing stored in-memory, everything in Redis."""
+        self.redis = get_redis_client()
 
-    def increment_job_completed(self, cost_usd: float = 0.0) -> None:
-        """Record job completion."""
-        with self.lock:
-            self.jobs_completed_count += 1
-            self.total_cost_usd += cost_usd
+    # ─── helpers ───────────────────────────────────────
+    def _r(self):
+        """Returns the raw Redis backend."""
+        return self.redis.backend
 
+    @staticmethod
+    def _now_iso() -> str:
+        return (
+            datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    # ─── events ────────────────────────────────────────
+    def add_event(self, event_type: str, details: Dict[str, Any] = None) -> None:
+        """Record a metrics event (stored in Redis list, capped at _MAX_EVENTS)."""
+        event = {
+            "timestamp": self._now_iso(),
+            "type": event_type,
+            "event": event_type,          # frontend reads both keys
+            **(details or {}),
+        }
+        self._r().rpush(_KEY_EVENTS, json.dumps(event))
+        # Trim so list doesn't grow unbounded
+        self._r().ltrim(_KEY_EVENTS, -_MAX_EVENTS, -1)
+
+    # ─── jobs ──────────────────────────────────────────
+    def increment_job_completed(self, cost_usd: float = 0.0,
+                                 job_id: str = None,
+                                 status: str = "success",
+                                 duration_ms: int = 0) -> None:
+        """Record job completion — updates counter, cost, and adds event."""
+        self._r().incr(_KEY_JOBS_COMPLETED)
+        # INCRBYFLOAT for precise cost accumulation
+        self._r().incrbyfloat(_KEY_TOTAL_COST, cost_usd)
+
+        # Record event
+        details = {}
+        if job_id:
+            details["job_id"] = job_id
+        if status:
+            details["status"] = status
+        if duration_ms:
+            details["duration_ms"] = duration_ms
+        details["cost_usd"] = cost_usd
+        self.add_event("job_completed", details)
+
+    # ─── workers ───────────────────────────────────────
     def set_workers_state(self, active: int, target: int) -> None:
-        """Update worker state."""
-        with self.lock:
-            self.workers_active_count = active
-            self.workers_target_count = target
+        """Update worker state (called by scaler)."""
+        self._r().set(_KEY_WORKERS_ACTIVE, str(active))
+        self._r().set(_KEY_WORKERS_TARGET, str(target))
 
+    def increment_workers_active(self) -> None:
+        self._r().incr(_KEY_WORKERS_ACTIVE)
+
+    def decrement_workers_active(self) -> None:
+        val = int(self._r().get(_KEY_WORKERS_ACTIVE) or 0)
+        self._r().set(_KEY_WORKERS_ACTIVE, str(max(0, val - 1)))
+
+    # ─── snapshot for GET /v1/metrics ──────────────────
     def get_snapshot(self) -> Dict[str, Any]:
-        """Get current metrics snapshot."""
+        """Get current metrics snapshot — all data from Redis."""
+        r = self._r()
         redis_client = get_redis_client()
 
-        with self.lock:
-            # Query Redis for runtime state
-            queue_depth = redis_client.get_queue_depth()
+        # Queue depth
+        queue_depth = redis_client.get_queue_depth()
 
-            # Count jobs by status
-            jobs_running = self._count_jobs_by_status("running")
+        # Jobs running (scan Redis for running jobs)
+        jobs_running = self._count_jobs_by_status("running")
 
-            return {
-                "queue_depth": queue_depth,
-                "workers_target": self.workers_target_count,
-                "workers_active": self.workers_active_count,
-                "jobs_running": jobs_running,
-                "jobs_completed_session": self.jobs_completed_count,
-                "total_cost_session_usd": self.total_cost_usd,
-                "events": list(self.events),
-            }
+        # Counters
+        jobs_completed = int(r.get(_KEY_JOBS_COMPLETED) or 0)
+        total_cost = float(r.get(_KEY_TOTAL_COST) or 0.0)
+        workers_active = int(r.get(_KEY_WORKERS_ACTIVE) or 0)
+        workers_target = int(r.get(_KEY_WORKERS_TARGET) or 1)
+
+        # Events list
+        raw_events = r.lrange(_KEY_EVENTS, 0, -1)
+        events = []
+        for raw in raw_events:
+            try:
+                events.append(json.loads(raw))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return {
+            "queue_depth": queue_depth,
+            "workers_target": workers_target,
+            "workers_active": workers_active,
+            "jobs_running": jobs_running,
+            "jobs_completed_session": jobs_completed,
+            "total_cost_session_usd": total_cost,
+            "events": events,
+        }
 
     def _count_jobs_by_status(self, status: str) -> int:
-        """Count jobs in Redis by status (approximate)."""
-        # For demo purposes, we scan Redis keys matching job:*
-        # In production, you'd maintain indices or use a database
+        """Count jobs in Redis by status."""
         redis_client = get_redis_client()
         count = 0
-
         try:
-            # Try to scan Redis keys (real Redis)
             if hasattr(redis_client.backend, "keys"):
-                pattern = "job:*"
-                keys = redis_client.backend.keys(pattern)
+                keys = redis_client.backend.keys("job:*")
                 for key in keys:
-                    job_data = redis_client.get_job(key.replace("job:", ""))
+                    job_id = key.replace("job:", "") if isinstance(key, str) else key.decode().replace("job:", "")
+                    job_data = redis_client.get_job(job_id)
                     if job_data and job_data.get("status") == status:
                         count += 1
         except Exception:
-            # Fall back to 0 if Redis doesn't support keys scanning
             pass
-
         return count
 
 
-# Global metrics instance (singleton)
+# ─── Singleton ────────────────────────────────────────
 _metrics: MetricsCollection = None
 
 
@@ -109,7 +154,16 @@ def get_metrics() -> MetricsCollection:
 
 
 def init_metrics() -> MetricsCollection:
-    """Initialize metrics collection."""
+    """Initialize metrics collection — resets session counters in Redis."""
     global _metrics
     _metrics = MetricsCollection()
+
+    # Reset session counters only (not worker state — workers track themselves)
+    r = _metrics._r()
+    r.set(_KEY_JOBS_COMPLETED, "0")
+    r.set(_KEY_TOTAL_COST, "0.0")
+    r.delete(_KEY_EVENTS)
+    # Don't reset workers_active / workers_target — workers register themselves
+
     return _metrics
+
