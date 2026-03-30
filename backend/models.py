@@ -74,3 +74,27 @@ class MetricsResponse(BaseModel):
         description="Recent events (worker spawned, job completed)",
     )
 
+
+# ─── Chat Models ───
+
+class ChatMessageRequest(BaseModel):
+    """Request body for POST /v1/chat."""
+    message: str = Field(..., min_length=1, max_length=4000, description="User message")
+    code: str = Field(default="", description="Optional code context")
+    session_id: Optional[str] = Field(default=None, description="Chat session ID (auto-created if missing)")
+
+
+class ChatMessageResponse(BaseModel):
+    """Response body for non-streaming chat."""
+    session_id: str = Field(..., description="Chat session ID")
+    response: str = Field(..., description="AI response text")
+
+
+class ChatSessionInfo(BaseModel):
+    """Info about a chat session."""
+    session_id: str
+    title: str
+    message_count: int
+    created_at: float
+
+

@@ -1,9 +1,11 @@
-"""FemScale FastAPI application - FINAL VERSION (CRUD + RERUN)."""
+"""FemScale FastAPI application — FINAL VERSION (CRUD + RERUN + AI TUTOR)."""
 
+import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import StreamingResponse
 
 from models import (
     StatusEnum,
@@ -11,17 +13,26 @@ from models import (
     JobSubmissionResponse,
     JobResultResponse,
     MetricsResponse,
+    ChatMessageRequest,
+    ChatMessageResponse,
 )
 from config import MAX_CODE_SIZE_BYTES
 from redis_client import init_redis
 from metrics import init_metrics, get_metrics
 from code_analyzer import analyze_code
 from complexity_analyzer import estimate_complexity
+from chat_service import (
+    chat_stream,
+    chat_sync,
+    get_or_create_session,
+    list_sessions,
+    delete_session,
+)
 
 app = FastAPI(
     title="FemScale",
-    description="Serverless Python function execution platform",
-    version="2.0.0",
+    description="Serverless Python function execution platform + AI Tutor",
+    version="3.0.0",
 )
 
 redis_client = None
@@ -134,6 +145,34 @@ def get_job(job_id: str):
 
 
 # -------------------------------
+# 📜 LIST ALL JOBS (for tutor code picker)
+# -------------------------------
+@app.get("/v1/jobs")
+def list_jobs():
+    """Return all stored jobs (id, status, code snippet, created_at)."""
+    all_keys = redis_client.backend.keys("job:*")
+    jobs = []
+    for key in all_keys:
+        raw = redis_client.backend.get(key)
+        if raw:
+            try:
+                job = json.loads(raw)
+                jobs.append({
+                    "job_id": job.get("job_id", ""),
+                    "status": job.get("status", ""),
+                    "code_preview": (job.get("code", ""))[:100],
+                    "code": job.get("code", ""),
+                    "created_at": job.get("created_at", ""),
+                })
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    # Sort newest first
+    jobs.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+    return {"jobs": jobs}
+
+
+# -------------------------------
 # ✏️ UPDATE (EDIT + RERUN)
 # -------------------------------
 @app.put("/v1/jobs/{job_id}")
@@ -187,6 +226,80 @@ def delete_job(job_id: str):
     redis_client.backend.delete(f"job:{job_id}")
 
     return {"message": "job deleted"}
+
+
+# ═══════════════════════════════════════
+# 🤖 AI TUTOR — CHAT ENDPOINTS
+# ═══════════════════════════════════════
+
+@app.post("/v1/chat")
+def chat_endpoint(request: ChatMessageRequest):
+    """Send a message to the AI tutor. Returns full response (non-streaming)."""
+    session = get_or_create_session(request.session_id)
+    response_text = chat_sync(
+        session_id=session.session_id,
+        user_message=request.message,
+        code=request.code,
+    )
+    return ChatMessageResponse(
+        session_id=session.session_id,
+        response=response_text,
+    )
+
+
+@app.post("/v1/chat/stream")
+async def chat_stream_endpoint(request: ChatMessageRequest):
+    """Send a message and get a streaming SSE response."""
+    session = get_or_create_session(request.session_id)
+
+    def event_generator():
+        for chunk in chat_stream(
+            session_id=session.session_id,
+            user_message=request.message,
+            code=request.code,
+        ):
+            # SSE format: data: <text>\n\n
+            escaped = json.dumps(chunk)
+            yield f"data: {escaped}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/v1/chat/sessions")
+def get_chat_sessions():
+    """List all chat sessions."""
+    return {"sessions": list_sessions()}
+
+
+@app.get("/v1/chat/sessions/{session_id}")
+def get_chat_session(session_id: str):
+    """Get full message history for a session."""
+    from chat_service import _sessions
+    if session_id not in _sessions:
+        raise HTTPException(status_code=404, detail="session not found")
+    session = _sessions[session_id]
+    return {
+        "session_id": session.session_id,
+        "title": session.title,
+        "messages": session.messages,
+    }
+
+
+@app.delete("/v1/chat/sessions/{session_id}")
+def delete_chat_session(session_id: str):
+    """Delete a chat session."""
+    if delete_session(session_id):
+        return {"message": "session deleted"}
+    raise HTTPException(status_code=404, detail="session not found")
 
 
 # -------------------------------

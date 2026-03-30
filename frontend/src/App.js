@@ -4,9 +4,10 @@ import { healthCheck } from './api';
 import SubmitPage from './SubmitPage';
 import ResultPage from './ResultPage';
 import DashboardPage from './DashboardPage';
+import TutorPage from './TutorPage';
 
 function App() {
-  const [page, setPage] = useState('submit');       // 'submit' | 'result' | 'dashboard'
+  const [page, setPage] = useState('submit');       // 'submit' | 'result' | 'dashboard' | 'tutor'
   const [activeJobId, setActiveJobId] = useState(null);
   const [health, setHealth] = useState(null);        // null | 'ok' | 'err'
   const [toasts, setToasts] = useState([]);
@@ -52,6 +53,8 @@ function App() {
         return <ResultPage jobId={activeJobId} onNavigate={navigate} addToast={addToast} />;
       case 'dashboard':
         return <DashboardPage onNavigate={navigate} addToast={addToast} />;
+      case 'tutor':
+        return <TutorPage onNavigate={navigate} addToast={addToast} />;
       default:
         return <SubmitPage onNavigate={navigate} addToast={addToast} />;
     }
@@ -83,6 +86,13 @@ function App() {
           >
             Dashboard
           </button>
+          <button
+            id="nav-tutor"
+            className={`nav-link ${page === 'tutor' ? 'active' : ''}`}
+            onClick={() => navigate('tutor')}
+          >
+            <span className="nav-tutor-icon">◆</span> AI Tutor
+          </button>
         </div>
 
         <div className="nav-health">
@@ -92,22 +102,24 @@ function App() {
       </nav>
 
       {/* Page Content */}
-      <main className="page-content" id="page-content">
+      <main className={`page-content ${page === 'tutor' ? 'tutor-page-content' : ''}`} id="page-content">
         {renderPage()}
       </main>
 
-      {/* Footer */}
-      <footer className="site-footer">
-        <div className="footer-left">
-          <span className="footer-brand">FEMSCALE</span>
-          <span className="footer-copy">2024 FemScale. Encrypted Terminal Access.</span>
-        </div>
-        <div className="footer-links">
-          <button className="footer-link" onClick={() => navigate('dashboard')}>Documentation</button>
-          <button className="footer-link">Privacy</button>
-          <button className="footer-link">System Status</button>
-        </div>
-      </footer>
+      {/* Footer — hidden on tutor page for full-height chat */}
+      {page !== 'tutor' && (
+        <footer className="site-footer">
+          <div className="footer-left">
+            <span className="footer-brand">FEMSCALE</span>
+            <span className="footer-copy">2024 FemScale. Encrypted Terminal Access.</span>
+          </div>
+          <div className="footer-links">
+            <button className="footer-link" onClick={() => navigate('dashboard')}>Documentation</button>
+            <button className="footer-link">Privacy</button>
+            <button className="footer-link">System Status</button>
+          </div>
+        </footer>
+      )}
 
       {/* Toast Container */}
       {toasts.length > 0 && (
