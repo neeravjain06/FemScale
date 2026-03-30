@@ -5,6 +5,8 @@ from typing import Optional, List, Dict, Any
 from enum import Enum
 from pydantic import BaseModel, Field, field_validator
 
+from typing import List, Dict, Any
+
 
 class StatusEnum(str, Enum):
     """Exact status strings used throughout the system."""
@@ -37,18 +39,20 @@ class JobSubmissionResponse(BaseModel):
 
 
 class JobResultResponse(BaseModel):
-    """Response body for GET /v1/jobs/{job_id}."""
     job_id: str = Field(..., description="UUID4 job identifier")
     status: StatusEnum = Field(..., description="Current job status")
     stdout: str = Field(default="", description="Captured standard output")
     stderr: str = Field(default="", description="Captured standard error")
+    insights: List[Dict[str, Any]] = Field(default_factory=list, description="Learning insights")
     error: Optional[str] = Field(default=None, description="Platform-level error message")
+    error_info: Optional[Dict[str, Any]] = None
     duration_ms: int = Field(default=0, description="Execution time in milliseconds")
     memory_mb: float = Field(default=0.0, description="Peak memory usage in MB")
+    complexity: str = Field(default="", description="Estimated time complexity")
+    complexity_note: str = Field(default="", description="Explanation of complexity")
     cost_usd: float = Field(default=0.0, description="Calculated cost in USD")
     created_at: str = Field(..., description="ISO8601 UTC submission timestamp")
     completed_at: Optional[str] = Field(default=None, description="ISO8601 UTC completion timestamp")
-
 
 class MetricsEvent(BaseModel):
     """A single event in the metrics event log."""

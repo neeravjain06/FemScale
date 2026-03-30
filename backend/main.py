@@ -1,4 +1,4 @@
-"""FemScale FastAPI application - Phase 2: Redis Queue Integration."""
+"""FemScale FastAPI application - FINAL VERSION (CRUD + RERUN)."""
 
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -12,62 +12,50 @@ from models import (
     JobResultResponse,
     MetricsResponse,
 )
-from config import MAX_CODE_SIZE_BYTES, DEFAULT_TIMEOUT_SEC
-from redis_client import get_redis_client, init_redis
+from config import MAX_CODE_SIZE_BYTES
+from redis_client import init_redis
 from metrics import init_metrics, get_metrics
-
+from code_analyzer import analyze_code
+from complexity_analyzer import estimate_complexity
 
 app = FastAPI(
     title="FemScale",
     description="Serverless Python function execution platform",
-    version="1.0.0",
+    version="2.0.0",
 )
 
-# Initialize Redis on startup
 redis_client = None
 metrics = None
 
 
+# -------------------------------
+# 🔧 STARTUP
+# -------------------------------
 @app.on_event("startup")
 async def startup_event():
-    """Initialize Redis connection and metrics on app startup."""
     global redis_client, metrics
     redis_client = init_redis()
     metrics = init_metrics()
 
 
-
-
 def get_iso8601_utc() -> str:
-    """Get current timestamp in ISO8601 UTC format."""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
+# -------------------------------
+# 🚀 CREATE JOB
+# -------------------------------
 @app.post(
     "/v1/jobs",
     response_model=JobSubmissionResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Submit a Python function for execution",
-    tags=["Jobs"],
 )
-def submit_job(request: JobSubmissionRequest) -> JobSubmissionResponse:
-    """
-    Submit a Python function for asynchronous execution.
+def submit_job(request: JobSubmissionRequest):
 
-    **Request Body:**
-    - `code`: Python function code (max 50KB)
-    - `timeout_sec`: Execution timeout in seconds (1–30, default 30)
-    - `input`: Optional input data for the function
-
-    **Response:**
-    - `job_id`: UUID4 identifier for polling
-    - `status`: Always "queued" on successful submission
-
-    **Errors:**
-    - 413 Payload Too Large: code exceeds 50KB
-    - 422 Unprocessable Entity: validation failed (empty code, invalid timeout)
-    """
-    # Validate code size
     code_size = len(request.code.encode("utf-8"))
     if code_size > MAX_CODE_SIZE_BYTES:
         raise HTTPException(
@@ -75,11 +63,12 @@ def submit_job(request: JobSubmissionRequest) -> JobSubmissionResponse:
             detail=f"code must not exceed {MAX_CODE_SIZE_BYTES} bytes",
         )
 
-    # Generate job_id and timestamps
     job_id = str(uuid4())
     created_at = get_iso8601_utc()
 
-    # Create job object
+    insights = analyze_code(request.code)
+    complexity, complexity_note = estimate_complexity(request.code)
+
     job = {
         "job_id": job_id,
         "code": request.code,
@@ -89,47 +78,37 @@ def submit_job(request: JobSubmissionRequest) -> JobSubmissionResponse:
         "stdout": "",
         "stderr": "",
         "error": None,
+        "error_info": None,
         "duration_ms": 0,
         "memory_mb": 0.0,
         "cost_usd": 0.0,
         "created_at": created_at,
         "completed_at": None,
+        "insights": insights,
+        "complexity": complexity,
+        "complexity_note": complexity_note,
     }
 
-    # Store job in Redis and enqueue
     redis_client.store_job(job_id, job)
     redis_client.enqueue_job(job_id)
 
-    return JobSubmissionResponse(job_id=job_id, status=StatusEnum.QUEUED)
+    return JobSubmissionResponse(
+        job_id=job_id,
+        status=StatusEnum.QUEUED,
+    )
 
 
+# -------------------------------
+# 📊 READ JOB
+# -------------------------------
 @app.get(
     "/v1/jobs/{job_id}",
     response_model=JobResultResponse,
-    summary="Poll job status and results",
-    tags=["Jobs"],
 )
-def get_job(job_id: str) -> JobResultResponse:
-    """
-    Poll the status and results of a submitted job.
+def get_job(job_id: str):
 
-    **Path Parameters:**
-    - `job_id`: UUID4 job identifier from POST /v1/jobs
-
-    **Response:**
-    - Full job object including status, output, metrics, and timestamps
-
-    **Status Values:**
-    - `queued`: Waiting in queue
-    - `running`: Container is executing
-    - `success`: Completed successfully (exit code 0)
-    - `failed`: Non-zero exit code
-    - `timeout`: Exceeded timeout_sec limit
-
-    **Errors:**
-    - 404 Not Found: job_id does not exist
-    """
     job = redis_client.get_job(job_id)
+
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -142,38 +121,81 @@ def get_job(job_id: str) -> JobResultResponse:
         stdout=job["stdout"],
         stderr=job["stderr"],
         error=job["error"],
+        error_info=job.get("error_info"),
         duration_ms=job["duration_ms"],
         memory_mb=job["memory_mb"],
         cost_usd=job["cost_usd"],
         created_at=job["created_at"],
         completed_at=job["completed_at"],
+        insights=job.get("insights", []),
+        complexity=job.get("complexity"),
+        complexity_note=job.get("complexity_note"),
     )
 
 
-@app.get(
-    "/v1/metrics",
-    response_model=MetricsResponse,
-    summary="Get system metrics and event log",
-    tags=["Metrics"],
-)
-def get_metrics_endpoint() -> MetricsResponse:
-    """
-    Get real-time system metrics and recent events.
+# -------------------------------
+# ✏️ UPDATE (EDIT + RERUN)
+# -------------------------------
+@app.put("/v1/jobs/{job_id}")
+def update_job(job_id: str, new_data: dict):
 
-    **Response:**
-    - `queue_depth`: Number of jobs waiting in queue
-    - `workers_target`: Target worker count from scaler policy
-    - `workers_active`: Currently running worker processes
-    - `jobs_running`: Jobs in "running" status
-    - `jobs_completed_session`: Total jobs completed this session
-    - `total_cost_session_usd`: Total execution cost this session
-    - `events`: Recent event log (worker spawned, job completed)
+    job = redis_client.get_job(job_id)
 
-    **Use Case:**
-    Real-time monitoring dashboard, auto-scaling observability
-    """
-    metrics_instance = get_metrics()
-    snapshot = metrics_instance.get_snapshot()
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    # 🔥 edit code
+    if "code" in new_data:
+        job["code"] = new_data["code"]
+
+    # optional edits
+    if "timeout_sec" in new_data:
+        job["timeout_sec"] = new_data["timeout_sec"]
+
+    if "input" in new_data:
+        job["input"] = new_data["input"]
+
+    # 🔥 reset job
+    job["status"] = "queued"
+    job["stdout"] = ""
+    job["stderr"] = ""
+    job["error"] = None
+    job["error_info"] = None
+    job["completed_at"] = None
+
+    # 🔥 requeue
+    redis_client.store_job(job_id, job)
+    redis_client.enqueue_job(job_id)
+
+    return {
+        "message": "job updated and re-queued",
+        "job_id": job_id
+    }
+
+
+# -------------------------------
+# ❌ DELETE JOB
+# -------------------------------
+@app.delete("/v1/jobs/{job_id}")
+def delete_job(job_id: str):
+
+    job = redis_client.get_job(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    redis_client.backend.delete(f"job:{job_id}")
+
+    return {"message": "job deleted"}
+
+
+# -------------------------------
+# 📈 METRICS
+# -------------------------------
+@app.get("/v1/metrics", response_model=MetricsResponse)
+def get_metrics_endpoint():
+
+    snapshot = get_metrics().get_snapshot()
 
     return MetricsResponse(
         queue_depth=snapshot["queue_depth"],
@@ -186,13 +208,17 @@ def get_metrics_endpoint() -> MetricsResponse:
     )
 
 
-@app.get("/health", tags=["System"])
-def health_check() -> dict:
-    """Health check endpoint."""
+# -------------------------------
+# ❤️ HEALTH CHECK
+# -------------------------------
+@app.get("/health")
+def health_check():
     return {"status": "ok"}
 
 
+# -------------------------------
+# 🏃 RUN SERVER
+# -------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
