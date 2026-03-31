@@ -27,7 +27,7 @@ MIN_WORKERS = 1
 SCALER_CHECK_INTERVAL_SEC = 3
 
 # ─── Groq AI Tutor ───
-GROQ_API_KEY = "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"
+GROQ_API_KEY = "your_groq_api_key_here"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_MAX_TOKENS = 2048
 GROQ_TEMPERATURE = 0.7
